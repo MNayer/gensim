@@ -23,6 +23,7 @@ from setuptools.command.build_ext import build_ext
 
 c_extensions = {
     'gensim.models.word2vec_inner': 'gensim/models/word2vec_inner.c',
+    'gensim.models.asm2vec_inner': 'gensim/models/asm2vec_inner.c',
     'gensim.corpora._mmreader': 'gensim/corpora/_mmreader.c',
     'gensim.models.fasttext_inner': 'gensim/models/fasttext_inner.c',
     'gensim._matutils': 'gensim/_matutils.c',
