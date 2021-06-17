@@ -18,6 +18,7 @@ cimport numpy as np
 from libc.math cimport exp
 from libc.math cimport log
 from libc.string cimport memset
+from libc.stdio cimport printf
 
 # scipy <= 0.15
 try:
@@ -29,6 +30,7 @@ except ImportError:
 REAL = np.float32
 
 DEF MAX_SENTENCE_LEN = 10000
+DEF MAX_EMBEDDING_SIZE = 1000
 
 cdef scopy_ptr scopy=<scopy_ptr>PyCObject_AsVoidPtr(fblas.scopy._cpointer)  # y = x
 cdef saxpy_ptr saxpy=<saxpy_ptr>PyCObject_AsVoidPtr(fblas.saxpy._cpointer)  # y += alpha * x
@@ -70,6 +72,30 @@ cdef void our_saxpy_noblas(const int *N, const float *alpha, const float *X, con
     cdef int i
     for i from 0 <= i < N[0] by 1:
         Y[i * (incY[0])] = (alpha[0]) * X[i * (incX[0])] + Y[i * (incY[0])]
+
+cdef void create_instruction_vector(REAL_t *dst, REAL_t *syn0, int size, const np.uint32_t indexes[MAX_SENTENCE_LEN], int idx_start, int idx_end) nogil:
+    """Maps to CT(.) of Asm2Vec-Paper.
+
+    Parameters
+    ----------
+    dst
+        Instruction vector calculated like CT(.) in Asm2Vec-Paper. Must have size*2.
+    """
+    cdef int i, n_operands
+    cdef REAL_t scale
+
+    # First half of dst is operator embedding.
+    scopy(&size, &syn0[<long long>indexes[idx_start] * <long long>size], &ONE, dst, &ONE)
+
+    # Second part of dst is mean of the operand embeddings.
+    memset(&dst[size], 0, size * cython.sizeof(REAL_t))
+    for i in range(idx_start + 1, idx_end):
+        row = <long long>indexes[i] * <long long>size
+        our_saxpy(&size, &ONEF, &syn0[row], &ONE, &dst[size], &ONE)
+    n_operands = idx_end - idx_start + 1
+    if n_operands > 1:
+        scale = 1. / n_operands
+        sscal(&size, &scale, &dst[size], &ONE)
 
 cdef void w2v_fast_sentence_sg_hs(
     const np.uint32_t *word_point, const np.uint8_t *word_code, const int codelen,
@@ -345,16 +371,16 @@ cdef void w2v_fast_sentence_cbow_hs(
             our_saxpy(&size, &words_lockf[indexes[m] % lockf_len], work, &ONE, &syn0[<long long>indexes[m] * <long long>size], &ONE)
 
 
-cdef unsigned long long w2v_fast_sentence_cbow_neg(
+cdef unsigned long long a2v_fast_sentence_cbow_neg(
     const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len, int codelens[MAX_SENTENCE_LEN],
     REAL_t *neu1,  REAL_t *syn0, REAL_t *syn1neg, const int size,
     const np.uint32_t indexes[MAX_SENTENCE_LEN], const REAL_t alpha, REAL_t *work,
-    int i, int j, int k, int cbow_mean, unsigned long long next_random, REAL_t *words_lockf,
+    int token_idx, int cbow_mean, unsigned long long next_random, REAL_t *words_lockf,
     const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) nogil:
     """Train on a single effective word from the current batch, using the CBOW method.
 
     Using this method we train the trainable neural network by attempting to predict a
-    given word by its context (words surrounding the one we are trying to predict).
+    given instruction by its context (instructions surrounding the one we are trying to predict).
     Negative sampling is used to speed-up training.
 
     Parameters
@@ -382,12 +408,8 @@ cdef unsigned long long w2v_fast_sentence_cbow_neg(
         Learning rate.
     work
         Private working memory for each worker.
-    i
-        Index of the word to be predicted from the context.
-    j
-        Index of the word at the beginning of the context window.
-    k
-        Index of the word at the end of the context window.
+    token_idx
+        Index of the current token.
     cbow_mean
         If 0, use the sum of the context word vectors as the prediction. If 1, use the mean.
     next_random
@@ -399,6 +421,7 @@ cdef unsigned long long w2v_fast_sentence_cbow_neg(
     _running_training_loss_param
         Running loss, used to debug or inspect how training progresses.
 
+    """
     """
     cdef long long a
     cdef long long row2
@@ -462,6 +485,8 @@ cdef unsigned long long w2v_fast_sentence_cbow_neg(
             our_saxpy(&size, &words_lockf[indexes[m] % lockf_len], work, &ONE, &syn0[<long long>indexes[m] * <long long>size], &ONE)
 
     return next_random
+    """
+    return next_random + 1
 
 
 cdef init_w2v_config(Asm2VecConfig *c, model, alpha, compute_loss, _work, _neu1=None):
@@ -480,6 +505,7 @@ cdef init_w2v_config(Asm2VecConfig *c, model, alpha, compute_loss, _work, _neu1=
     c[0].words_lockf_len = len(model.wv.vectors_lockf)
     c[0].alpha = alpha
     c[0].size = model.wv.vector_size
+    c[0].dsize = model.wv.vector_size * 2
 
     if c[0].hs:
         c[0].syn1 = <REAL_t *>(np.PyArray_DATA(model.syn1))
@@ -619,13 +645,23 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
         Number of words in the vocabulary actually used for training (They already existed in the vocabulary
         and were not discarded by negative sampling).
     """
-    cdef Asm2VecConfig c
-    cdef int i, j, k
-    cdef int effective_words = 0, effective_sentences = 0
-    cdef int sent_idx, idx_start, idx_end
-    cdef np.uint32_t *vocab_sample_ints
+    cdef:
+        Asm2VecConfig c
+        int effective_words = 0, effective_sentences = 0
+        int sent_idx, idx_start, idx_end
+        int prev_instr_start, prev_instr_end
+        int instr_start, instr_end
+        int next_instr_start, next_instr_end
+        int token_idx
+        np.uint32_t *vocab_sample_ints
+        REAL_t scale
+        REAL_t prev_instr_vec[MAX_EMBEDDING_SIZE]
+        REAL_t next_instr_vec[MAX_EMBEDDING_SIZE]
+        REAL_t delta_vec[MAX_EMBEDDING_SIZE]
 
     init_w2v_config(&c, model, alpha, compute_loss, _work, _neu1)
+    if c.dsize > MAX_EMBEDDING_SIZE:
+        raise ValueError("Invalid value for 'size'. Value must be in range [1, MAX_EMBEDDING_SIZE]. With 'MAX_EMBEDDING_SIZE' being %d." % MAX_EMBEDDING_SIZE)
     if c.sample:
         vocab_sample_ints = <np.uint32_t *>np.PyArray_DATA(model.wv.expandos['sample_int'])
     if c.hs:
@@ -661,26 +697,29 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
         if effective_words == MAX_SENTENCE_LEN:
             break  # TODO: log warning, tally overflow?
 
-    # precompute "reduced window" offsets in a single randint() call
-    for i, item in enumerate(model.random.randint(0, c.window, effective_words)):
-        c.reduced_windows[i] = item
-
     # release GIL & train on all sentences
     with nogil:
-        for sent_idx in range(effective_sentences):
-            idx_start = c.sentence_idx[sent_idx]
-            idx_end = c.sentence_idx[sent_idx + 1]
-            for i in range(idx_start, idx_end):
-                j = i - c.window + c.reduced_windows[i]
-                if j < idx_start:
-                    j = idx_start
-                k = i + c.window + 1 - c.reduced_windows[i]
-                if k > idx_end:
-                    k = idx_end
-                if c.hs:
-                    w2v_fast_sentence_cbow_hs(c.points[i], c.codes[i], c.codelens, c.neu1, c.syn0, c.syn1, c.size, c.indexes, c.alpha, c.work, i, j, k, c.cbow_mean, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
-                if c.negative:
-                    c.next_random = w2v_fast_sentence_cbow_neg(c.negative, c.cum_table, c.cum_table_len, c.codelens, c.neu1, c.syn0, c.syn1neg, c.size, c.indexes, c.alpha, c.work, i, j, k, c.cbow_mean, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+        for sent_idx in range(1, effective_sentences-1):
+            prev_instr_start = c.sentence_idx[sent_idx-1]
+            prev_instr_end = c.sentence_idx[sent_idx]
+            instr_start = c.sentence_idx[sent_idx]
+            instr_end = c.sentence_idx[sent_idx+1]
+            next_instr_start = c.sentence_idx[sent_idx+1]
+            next_instr_end = c.sentence_idx[sent_idx+2]
+
+            # Create instruction vector for prev. and next instruction
+            create_instruction_vector(prev_instr_vec, c.syn0, c.size, c.indexes, prev_instr_start, prev_instr_end)
+            create_instruction_vector(next_instr_vec, c.syn0, c.size, c.indexes, next_instr_start, next_instr_end)
+
+            # Delta pre calculation
+            scale = 1. / 2.
+            scopy(&c.dsize, prev_instr_vec, &ONE, delta_vec, &ONE)
+            our_saxpy(&c.dsize, &ONEF, next_instr_vec, &ONE, delta_vec, &ONE)
+            sscal(&c.dsize, &scale, &dst[size], &ONE)
+
+            for token_idx in range(instr_start, instr_end):
+                printf("sent_idx: %d, token_idx: %d, prev_instr_start: %d, prev_instr_end: %d, instr_start: %d, instr_end: %d, next_instr_start: %d, next_instr_end: %d\n", sent_idx, token_idx, prev_instr_start, prev_instr_end, instr_start, instr_end, next_instr_start, next_instr_end)
+                #c.next_random = a2v_fast_sentence_cbow_neg(c.negative, c.cum_table, c.cum_table_len, c.codelens, c.neu1, c.syn0, c.syn1neg, c.size, c.indexes, c.alpha, c.work, token_idx, c.cbow_mean, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
 
     model.running_training_loss = c.running_training_loss
     return effective_words

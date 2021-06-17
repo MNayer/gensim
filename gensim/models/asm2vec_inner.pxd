@@ -49,7 +49,7 @@ cdef our_saxpy_ptr our_saxpy
 
 
 cdef struct Asm2VecConfig:
-    int hs, negative, sample, compute_loss, size, window, cbow_mean, workers
+    int hs, negative, sample, compute_loss, size, dsize, window, cbow_mean, workers
     REAL_t running_training_loss, alpha
 
     REAL_t *syn0
@@ -115,11 +115,11 @@ cdef void w2v_fast_sentence_cbow_hs(
     const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) nogil
 
 
-cdef unsigned long long w2v_fast_sentence_cbow_neg(
+cdef unsigned long long a2v_fast_sentence_cbow_neg(
     const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len, int codelens[MAX_SENTENCE_LEN],
     REAL_t *neu1,  REAL_t *syn0, REAL_t *syn1neg, const int size,
     const np.uint32_t indexes[MAX_SENTENCE_LEN], const REAL_t alpha, REAL_t *work,
-    int i, int j, int k, int cbow_mean, unsigned long long next_random, REAL_t *words_lockf,
+    int j, int cbow_mean, unsigned long long next_random, REAL_t *words_lockf,
     const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) nogil
 
 
