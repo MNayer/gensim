@@ -407,7 +407,7 @@ class Asm2Vec(utils.SaveLoad):
         self.hashfxn = hashfxn
         self.seed = seed
         if not hasattr(self, 'layer1_size'):  # set unless subclass already set (as for Doc2Vec dm_concat mode)
-            self.layer1_size = vector_size
+            self.layer1_size = vector_size * 2
 
         self.comment = comment
 
@@ -1086,6 +1086,36 @@ class Asm2Vec(utils.SaveLoad):
             callback.on_train_end(self)
 
         return trained_word_count, raw_word_count
+
+    def instruction_vector(self, instruction):
+        """Calculates the instruction vector for a given instruction.
+
+        Parameters
+        ----------
+        instruction : list of str
+            List of the tokenized instruction.
+
+        Returns
+        -------
+        np.ndarray
+            Vector for the instruction.
+
+        """
+        if len(instruction) == 0:
+            logger.warning("Instruction does not contain any tokens")
+            return None
+        token_indices = [self.wv.get_index(tkn) for tkn in instruction if tkn in self.wv]
+        if len(token_indices) != len(instruction):
+            logger.warning("At least one instruction token is out-of-vocabulary for the current model.")
+            return None
+
+        op_vec = self.wv.vectors[token_indices[0]]
+        if len(token_indices) == 1:
+            arg_vec = np.zeros(self.vector_size)
+        else:
+            arg_vec = np.mean([self.wv.vectors[idx] for idx in token_indices[1:]], axis=0)
+
+        return np.hstack((op_vec, arg_vec))
 
     def _worker_loop_corpusfile(
             self, corpus_file, thread_id, offset, cython_vocab, progress_queue, cur_epoch=0,

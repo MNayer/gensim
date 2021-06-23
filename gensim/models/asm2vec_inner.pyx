@@ -80,6 +80,7 @@ cdef void create_instruction_vector(REAL_t *dst, REAL_t *syn0, int size, const n
     ----------
     dst
         Instruction vector calculated like CT(.) in Asm2Vec-Paper. Must have size*2.
+
     """
     cdef int i, n_operands
     cdef REAL_t scale
@@ -96,6 +97,64 @@ cdef void create_instruction_vector(REAL_t *dst, REAL_t *syn0, int size, const n
     if n_operands > 1:
         scale = 1. / n_operands
         sscal(&size, &scale, &dst[size], &ONE)
+
+cdef np.uint32_t choice_cum_table(np.uint32_t *cum_table, unsigned long long cum_table_len, unsigned long long *next_random) nogil:
+    """Randomly sample a word from the vocabulary using the frequency calculated beforehand.
+
+    Parameters
+    ----------
+    cum_table
+        Cumulative-distribution table using stored vocabulary word counts for
+        drawing random words (with a negative label).
+    cum_table_len
+        Length of the `cum_table`.
+    next_random
+        Seed for the drawing the predicted word for the next iteration of the same routine.
+
+    """
+    cdef np.uint32_t target_index
+    cdef unsigned long long modulo = 281474976710655ULL
+    target_index = bisect_left(cum_table, (next_random[0] >> 16) % cum_table[cum_table_len-1], 0, cum_table_len)
+    next_random[0] = (next_random[0] * <unsigned long long>25214903917ULL + 11) & modulo
+    return target_index
+
+
+cdef REAL_t apxsigmoid(REAL_t x) nogil:
+    """Approximation of sigmoid of x using a lookup table.
+
+    Parameters
+    ----------
+    x
+        Input value for approximate sigmoid function.
+
+    Returns
+    -------
+    REAL_t
+        Approximate sigmoid(x).
+
+    """
+    if x > MAX_EXP:
+        return 1.
+    elif x < -MAX_EXP:
+        return 0.
+    return EXP_TABLE[<int>((x + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]
+    
+
+cdef void vchoice_cum_table(const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len) nogil:
+    """Create vector with randomly sampled word indexes.
+
+    Parameters
+    ----------
+    negative
+        Number of negative words to be sampled.
+    cum_table
+        Cumulative-distribution table using stored vocabulary word counts for
+        drawing random words (with a negative label).
+    cum_table_len
+        Length of the `cum_table`
+    
+    """
+    return
 
 cdef void w2v_fast_sentence_sg_hs(
     const np.uint32_t *word_point, const np.uint8_t *word_code, const int codelen,
@@ -136,7 +195,6 @@ cdef void w2v_fast_sentence_sg_hs(
         Running loss, used to debug or inspect how training progresses.
 
     """
-
     cdef long long a, b
     cdef long long row1 = <long long>word2_index * <long long>size, row2, sgn
     cdef REAL_t f, g, f_dot, lprob
@@ -373,11 +431,12 @@ cdef void w2v_fast_sentence_cbow_hs(
 
 cdef unsigned long long a2v_fast_sentence_cbow_neg(
     const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len, int codelens[MAX_SENTENCE_LEN],
+    REAL_t *prev_instr_vec, REAL_t *next_instr_vec, REAL_t *delta_vec,
     REAL_t *neu1,  REAL_t *syn0, REAL_t *syn1neg, const int size,
     const np.uint32_t indexes[MAX_SENTENCE_LEN], const REAL_t alpha, REAL_t *work,
     int token_idx, int cbow_mean, unsigned long long next_random, REAL_t *words_lockf,
     const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) nogil:
-    """Train on a single effective word from the current batch, using the CBOW method.
+    """Train on a single effective token from an instruction of the current batch, using the Asm2Vec method.
 
     Using this method we train the trainable neural network by attempting to predict a
     given instruction by its context (instructions surrounding the one we are trying to predict).
@@ -394,6 +453,12 @@ cdef unsigned long long a2v_fast_sentence_cbow_neg(
         Length of the `cum_table`
     codelens
         Number of characters (length) for all words in the context.
+    prev_instr_vec
+        Asm2Vec CT(previous instruction).
+    next_instr_vec
+        Asm2Vec CT(next instruction).
+    delta_vec
+        Joint memory of neighbor instructions (Asm2Vec-Paper: delta).
     neu1
         Private working memory for every worker.
     syn0
@@ -425,7 +490,7 @@ cdef unsigned long long a2v_fast_sentence_cbow_neg(
     """
     cdef long long a
     cdef long long row2
-    cdef unsigned long long modulo = 281474976710655ULL
+    #cdef unsigned long long modulo = 281474976710655ULL
     cdef REAL_t f, g, count, inv_count = 1.0, label, log_e_f_dot, f_dot
     cdef np.uint32_t target_index, word_index
     cdef int d, m
@@ -448,21 +513,24 @@ cdef unsigned long long a2v_fast_sentence_cbow_neg(
     memset(work, 0, size * cython.sizeof(REAL_t))
 
     for d in range(negative+1):
+        # For each target (real target + negative samples)
         if d == 0:
             target_index = word_index
             label = ONEF
         else:
-            target_index = bisect_left(cum_table, (next_random >> 16) % cum_table[cum_table_len-1], 0, cum_table_len)
-            next_random = (next_random * <unsigned long long>25214903917ULL + 11) & modulo
+            #target_index = bisect_left(cum_table, (next_random >> 16) % cum_table[cum_table_len-1], 0, cum_table_len)
+            #next_random = (next_random * <unsigned long long>25214903917ULL + 11) & modulo
+            target_index = choice_cum_table(cum_table, cum_table_len, &next_random)
             if target_index == word_index:
                 continue
             label = <REAL_t>0.0
 
         row2 = <long long>target_index * <long long>size
         f_dot = our_dot(&size, neu1, &ONE, &syn1neg[row2], &ONE)
-        if f_dot <= -MAX_EXP or f_dot >= MAX_EXP:
-            continue
-        f = EXP_TABLE[<int>((f_dot + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]
+        #if f_dot <= -MAX_EXP or f_dot >= MAX_EXP:
+        #    continue
+        #f = EXP_TABLE[<int>((f_dot + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]
+        f = apxsigmoid(f_dot)
         g = (label - f) * alpha
 
         if _compute_loss == 1:
@@ -659,6 +727,13 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
         REAL_t next_instr_vec[MAX_EMBEDDING_SIZE]
         REAL_t delta_vec[MAX_EMBEDDING_SIZE]
 
+        #long long a
+        long long row
+        #REAL_t f, g, count, inv_count = 1.0, label, log_e_f_dot, f_dot
+        REAL_t pre_calc, f_dot, label
+        np.uint32_t target_idx, word_idx
+        int d
+
     init_w2v_config(&c, model, alpha, compute_loss, _work, _neu1)
     if c.dsize > MAX_EMBEDDING_SIZE:
         raise ValueError("Invalid value for 'size'. Value must be in range [1, MAX_EMBEDDING_SIZE]. With 'MAX_EMBEDDING_SIZE' being %d." % MAX_EMBEDDING_SIZE)
@@ -676,14 +751,14 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
         for token in sent:
             if token not in model.wv.key_to_index:
                 continue  # leaving `effective_words` unchanged = shortening the sentence = expanding the window
-            word_index = model.wv.key_to_index[token]
-            if c.sample and vocab_sample_ints[word_index] < random_int32(&c.next_random):
+            word_idx = model.wv.key_to_index[token]
+            if c.sample and vocab_sample_ints[word_idx] < random_int32(&c.next_random):
                 continue
-            c.indexes[effective_words] = word_index
+            c.indexes[effective_words] = word_idx
             if c.hs:
-                c.codelens[effective_words] = <int>len(vocab_codes[word_index])
-                c.codes[effective_words] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_index])
-                c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_index])
+                c.codelens[effective_words] = <int>len(vocab_codes[word_idx])
+                c.codes[effective_words] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_idx])
+                c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_idx])
             effective_words += 1
             if effective_words == MAX_SENTENCE_LEN:
                 break  # TODO: log warning, tally overflow?
@@ -700,6 +775,7 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
     # release GIL & train on all sentences
     with nogil:
         for sent_idx in range(1, effective_sentences-1):
+            # Going through each instruction (in the sequence).
             prev_instr_start = c.sentence_idx[sent_idx-1]
             prev_instr_end = c.sentence_idx[sent_idx]
             instr_start = c.sentence_idx[sent_idx]
@@ -715,11 +791,59 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
             scale = 1. / 2.
             scopy(&c.dsize, prev_instr_vec, &ONE, delta_vec, &ONE)
             our_saxpy(&c.dsize, &ONEF, next_instr_vec, &ONE, delta_vec, &ONE)
-            sscal(&c.dsize, &scale, &dst[size], &ONE)
+            sscal(&c.dsize, &scale, delta_vec, &ONE)
+
+            # Per thread working memory
+            memset(c.work, 0, c.dsize * cython.sizeof(REAL_t))
 
             for token_idx in range(instr_start, instr_end):
-                printf("sent_idx: %d, token_idx: %d, prev_instr_start: %d, prev_instr_end: %d, instr_start: %d, instr_end: %d, next_instr_start: %d, next_instr_end: %d\n", sent_idx, token_idx, prev_instr_start, prev_instr_end, instr_start, instr_end, next_instr_start, next_instr_end)
-                #c.next_random = a2v_fast_sentence_cbow_neg(c.negative, c.cum_table, c.cum_table_len, c.codelens, c.neu1, c.syn0, c.syn1neg, c.size, c.indexes, c.alpha, c.work, token_idx, c.cbow_mean, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+                # Going through each token (in the instruction).
+                #printf("sent_idx: %d, token_idx: %d, prev_instr_start: %d, prev_instr_end: %d, instr_start: %d, instr_end: %d, next_instr_start: %d, next_instr_end: %d\n", sent_idx, token_idx, prev_instr_start, prev_instr_end, instr_start, instr_end, next_instr_start, next_instr_end)
+                #c.next_random = a2v_fast_sentence_cbow_neg(c.negative, c.cum_table, c.cum_table_len, c.codelens, prev_instr_vec, next_instr_vec, delta_vec, c.neu1, c.syn0, c.syn1neg, c.size, c.indexes, c.alpha, c.work, token_idx, c.cbow_mean, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+                for d in range(c.negative+1):
+                    # For each target (real target + negative samples)
+                    if d == 0:
+                        target_idx = c.indexes[token_idx]
+                        label = ONEF
+                    else:
+                        target_idx = choice_cum_table(c.cum_table, c.cum_table_len, &c.next_random)
+                        if target_idx == c.indexes[token_idx]:
+                            continue
+                        label = <REAL_t>0.0
+
+                    # Calculate gradient using adjusted Equ. (7)
+                    row = <long long>target_idx * <long long>c.dsize
+                    f_dot = our_dot(&c.dsize, delta_vec, &ONE, &c.syn1neg[row], &ONE)
+                    pre_calc = (label - apxsigmoid(f_dot)) * c.alpha
+
+                    # Cummulate gradients for instruction
+                    # work += pre_calc * W'[target_idx]
+                    our_saxpy(&c.dsize, &pre_calc, &c.syn1neg[row], &ONE, c.work, &ONE)
+
+                    # Update token vectors prime
+                    # W'[target_idx] += pre_calc * delta_vec
+                    our_saxpy(&c.dsize, &pre_calc, delta_vec, &ONE, &c.syn1neg[row], &ONE)
+
+            scale = 1. / 2.
+            sscal(&c.dsize, &scale, c.work, &ONE)
+            
+            # Calculate gradient for prev. instruction using Equ. (8) and update prev. instruction vector
+            row = <long long>c.indexes[prev_instr_start] * <long long>c.size
+            our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
+            if prev_instr_end - prev_instr_start > 1:
+                scale = 1. / (prev_instr_end - prev_instr_start - 1)
+                for token_idx in range(prev_instr_start + 1, prev_instr_end):
+                    row = <long long>c.indexes[token_idx] * <long long>c.size
+                    our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
+
+            # Calculate gradient for next instruction using Equ. (8) and update next instruction vector
+            row = <long long>c.indexes[next_instr_start] * <long long>c.size
+            our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
+            if next_instr_end - next_instr_start > 1:
+                scale = 1. / (next_instr_end - next_instr_start - 1)
+                for token_idx in range(next_instr_start + 1, next_instr_end):
+                    row = <long long>c.indexes[token_idx] * <long long>c.size
+                    our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
 
     model.running_training_loss = c.running_training_loss
     return effective_words

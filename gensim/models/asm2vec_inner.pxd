@@ -115,11 +115,21 @@ cdef void w2v_fast_sentence_cbow_hs(
     const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) nogil
 
 
+"""
 cdef unsigned long long a2v_fast_sentence_cbow_neg(
     const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len, int codelens[MAX_SENTENCE_LEN],
     REAL_t *neu1,  REAL_t *syn0, REAL_t *syn1neg, const int size,
     const np.uint32_t indexes[MAX_SENTENCE_LEN], const REAL_t alpha, REAL_t *work,
     int j, int cbow_mean, unsigned long long next_random, REAL_t *words_lockf,
+    const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) nogil
+"""
+
+cdef unsigned long long a2v_fast_sentence_cbow_neg(
+    const int negative, np.uint32_t *cum_table, unsigned long long cum_table_len, int codelens[MAX_SENTENCE_LEN],
+    REAL_t *prev_instr_vec, REAL_t *next_instr_vec, REAL_t *delta_vec,
+    REAL_t *neu1,  REAL_t *syn0, REAL_t *syn1neg, const int size,
+    const np.uint32_t indexes[MAX_SENTENCE_LEN], const REAL_t alpha, REAL_t *work,
+    int token_idx, int cbow_mean, unsigned long long next_random, REAL_t *words_lockf,
     const np.uint32_t lockf_len, const int _compute_loss, REAL_t *_running_training_loss_param) nogil
 
 
