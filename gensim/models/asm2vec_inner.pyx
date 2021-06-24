@@ -30,6 +30,7 @@ except ImportError:
 REAL = np.float32
 
 DEF MAX_SENTENCE_LEN = 10000
+DEF MAX_INSTRUCTION_LEN = 10000
 DEF MAX_EMBEDDING_SIZE = 1000
 
 cdef scopy_ptr scopy=<scopy_ptr>PyCObject_AsVoidPtr(fblas.scopy._cpointer)  # y = x
@@ -696,7 +697,7 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
     ----------
     model : :class:`~gensim.models.word2vec.Word2Vec`
         The Word2Vec model instance to train.
-    sentences : iterable of list of str
+    sentences : iterable of list of list of str. 
         The corpus used to train the model.
     alpha : float
         The learning rate.
@@ -715,8 +716,8 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
     """
     cdef:
         Asm2VecConfig c
-        int effective_words = 0, effective_sentences = 0
-        int sent_idx, idx_start, idx_end
+        int effective_words = 0, effective_sentences = 0, effective_instructions = 0
+        int sent_idx, sent_start, sent_end, idx_start, idx_end, inst_idx
         int prev_instr_start, prev_instr_end
         int instr_start, instr_end
         int next_instr_start, next_instr_end
@@ -745,105 +746,118 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
 
     # prepare C structures so we can go "full C" and release the Python GIL
     c.sentence_idx[0] = 0  # indices of the first sentence always start at 0
+    c.instruction_idx[0] = 0 # indices of the first instruction always start at 0
     for sent in sentences:
         if not sent:
             continue  # ignore empty sentences; leave effective_sentences unchanged
-        for token in sent:
-            if token not in model.wv.key_to_index:
-                continue  # leaving `effective_words` unchanged = shortening the sentence = expanding the window
-            word_idx = model.wv.key_to_index[token]
-            if c.sample and vocab_sample_ints[word_idx] < random_int32(&c.next_random):
-                continue
-            c.indexes[effective_words] = word_idx
-            if c.hs:
-                c.codelens[effective_words] = <int>len(vocab_codes[word_idx])
-                c.codes[effective_words] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_idx])
-                c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_idx])
-            effective_words += 1
-            if effective_words == MAX_SENTENCE_LEN:
+        for instruction in sent:
+            for token in instruction:
+                if token not in model.wv.key_to_index:
+                    continue  # leaving `effective_words` unchanged = shortening the sentence = expanding the window
+                word_idx = model.wv.key_to_index[token]
+                if c.sample and vocab_sample_ints[word_idx] < random_int32(&c.next_random):
+                    continue
+                c.indexes[effective_words] = word_idx
+                if c.hs:
+                    c.codelens[effective_words] = <int>len(vocab_codes[word_idx])
+                    c.codes[effective_words] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_idx])
+                    c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_idx])
+                effective_words += 1
+                if effective_words == MAX_SENTENCE_LEN:
+                    break  # TODO: log warning, tally overflow?
+
+            # keep track of which words go into which instruction
+            # indices of instruction number X are between <instruction_idx[X], instruction_idx[X])
+            effective_instructions += 1
+            c.instruction_idx[effective_instructions] = effective_words
+            if effective_instructions == MAX_INSTRUCTION_LEN:
                 break  # TODO: log warning, tally overflow?
 
         # keep track of which words go into which sentence, so we don't train
         # across sentence boundaries.
         # indices of sentence number X are between <sentence_idx[X], sentence_idx[X])
         effective_sentences += 1
-        c.sentence_idx[effective_sentences] = effective_words
+        c.sentence_idx[effective_sentences] = effective_instructions
 
         if effective_words == MAX_SENTENCE_LEN:
             break  # TODO: log warning, tally overflow?
 
+
     # release GIL & train on all sentences
     with nogil:
-        for sent_idx in range(1, effective_sentences-1):
-            # Going through each instruction (in the sequence).
-            prev_instr_start = c.sentence_idx[sent_idx-1]
-            prev_instr_end = c.sentence_idx[sent_idx]
-            instr_start = c.sentence_idx[sent_idx]
-            instr_end = c.sentence_idx[sent_idx+1]
-            next_instr_start = c.sentence_idx[sent_idx+1]
-            next_instr_end = c.sentence_idx[sent_idx+2]
+        for sent_idx in range(0, effective_sentences):
+            sent_start = c.sentence_idx[sent_idx]
+            sent_end = c.sentence_idx[sent_idx + 1]
+            for inst_idx in range(sent_start+1, sent_end-1):
+                # Going through each instruction (in the sequence).
+                prev_instr_start = c.instruction_idx[inst_idx-1]
+                prev_instr_end = c.instruction_idx[inst_idx]
+                instr_start = c.instruction_idx[inst_idx]
+                instr_end = c.instruction_idx[inst_idx+1]
+                next_instr_start = c.instruction_idx[inst_idx+1]
+                next_instr_end = c.instruction_idx[inst_idx+2]
 
-            # Create instruction vector for prev. and next instruction
-            create_instruction_vector(prev_instr_vec, c.syn0, c.size, c.indexes, prev_instr_start, prev_instr_end)
-            create_instruction_vector(next_instr_vec, c.syn0, c.size, c.indexes, next_instr_start, next_instr_end)
+                # Create instruction vector for prev. and next instruction
+                create_instruction_vector(prev_instr_vec, c.syn0, c.size, c.indexes, prev_instr_start, prev_instr_end)
+                create_instruction_vector(next_instr_vec, c.syn0, c.size, c.indexes, next_instr_start, next_instr_end)
 
-            # Delta pre calculation
-            scale = 1. / 2.
-            scopy(&c.dsize, prev_instr_vec, &ONE, delta_vec, &ONE)
-            our_saxpy(&c.dsize, &ONEF, next_instr_vec, &ONE, delta_vec, &ONE)
-            sscal(&c.dsize, &scale, delta_vec, &ONE)
+                # Delta pre calculation
+                scale = 1. / 2.
+                scopy(&c.dsize, prev_instr_vec, &ONE, delta_vec, &ONE)
+                our_saxpy(&c.dsize, &ONEF, next_instr_vec, &ONE, delta_vec, &ONE)
+                sscal(&c.dsize, &scale, delta_vec, &ONE)
 
-            # Per thread working memory
-            memset(c.work, 0, c.dsize * cython.sizeof(REAL_t))
+                # Per thread working memory
+                memset(c.work, 0, c.dsize * cython.sizeof(REAL_t))
 
-            for token_idx in range(instr_start, instr_end):
-                # Going through each token (in the instruction).
-                #printf("sent_idx: %d, token_idx: %d, prev_instr_start: %d, prev_instr_end: %d, instr_start: %d, instr_end: %d, next_instr_start: %d, next_instr_end: %d\n", sent_idx, token_idx, prev_instr_start, prev_instr_end, instr_start, instr_end, next_instr_start, next_instr_end)
-                #c.next_random = a2v_fast_sentence_cbow_neg(c.negative, c.cum_table, c.cum_table_len, c.codelens, prev_instr_vec, next_instr_vec, delta_vec, c.neu1, c.syn0, c.syn1neg, c.size, c.indexes, c.alpha, c.work, token_idx, c.cbow_mean, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
-                for d in range(c.negative+1):
-                    # For each target (real target + negative samples)
-                    if d == 0:
-                        target_idx = c.indexes[token_idx]
-                        label = ONEF
-                    else:
-                        target_idx = choice_cum_table(c.cum_table, c.cum_table_len, &c.next_random)
-                        if target_idx == c.indexes[token_idx]:
-                            continue
-                        label = <REAL_t>0.0
+                for token_idx in range(instr_start, instr_end):
+                    # Going through each token (in the instruction).
+                    #printf("sent_idx: %d, sent_start: %d, sent_end: %d, inst_idx: %d, token_idx: %d, prev_instr_start: %d, prev_instr_end: %d, instr_start: %d, instr_end: %d, next_instr_start: %d, next_instr_end: %d\n", sent_idx, sent_start, sent_end, inst_idx, token_idx, prev_instr_start, prev_instr_end, instr_start, instr_end, next_instr_start, next_instr_end)
+                    #c.next_random = a2v_fast_sentence_cbow_neg(c.negative, c.cum_table, c.cum_table_len, c.codelens, prev_instr_vec, next_instr_vec, delta_vec, c.neu1, c.syn0, c.syn1neg, c.size, c.indexes, c.alpha, c.work, token_idx, c.cbow_mean, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
+                    for d in range(c.negative+1):
+                        # For each target (real target + negative samples)
+                        if d == 0:
+                            target_idx = c.indexes[token_idx]
+                            label = ONEF
+                        else:
+                            target_idx = choice_cum_table(c.cum_table, c.cum_table_len, &c.next_random)
+                            if target_idx == c.indexes[token_idx]:
+                                continue
+                            label = <REAL_t>0.0
 
-                    # Calculate gradient using adjusted Equ. (7)
-                    row = <long long>target_idx * <long long>c.dsize
-                    f_dot = our_dot(&c.dsize, delta_vec, &ONE, &c.syn1neg[row], &ONE)
-                    pre_calc = (label - apxsigmoid(f_dot)) * c.alpha
+                        # Calculate gradient using adjusted Equ. (7)
+                        row = <long long>target_idx * <long long>c.dsize
+                        f_dot = our_dot(&c.dsize, delta_vec, &ONE, &c.syn1neg[row], &ONE)
+                        pre_calc = (label - apxsigmoid(f_dot)) * c.alpha
 
-                    # Cummulate gradients for instruction
-                    # work += pre_calc * W'[target_idx]
-                    our_saxpy(&c.dsize, &pre_calc, &c.syn1neg[row], &ONE, c.work, &ONE)
+                        # Cummulate gradients for instruction
+                        # work += pre_calc * W'[target_idx]
+                        our_saxpy(&c.dsize, &pre_calc, &c.syn1neg[row], &ONE, c.work, &ONE)
 
-                    # Update token vectors prime
-                    # W'[target_idx] += pre_calc * delta_vec
-                    our_saxpy(&c.dsize, &pre_calc, delta_vec, &ONE, &c.syn1neg[row], &ONE)
+                        # Update token vectors prime
+                        # W'[target_idx] += pre_calc * delta_vec
+                        our_saxpy(&c.dsize, &pre_calc, delta_vec, &ONE, &c.syn1neg[row], &ONE)
 
-            scale = 1. / 2.
-            sscal(&c.dsize, &scale, c.work, &ONE)
-            
-            # Calculate gradient for prev. instruction using Equ. (8) and update prev. instruction vector
-            row = <long long>c.indexes[prev_instr_start] * <long long>c.size
-            our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
-            if prev_instr_end - prev_instr_start > 1:
-                scale = 1. / (prev_instr_end - prev_instr_start - 1)
-                for token_idx in range(prev_instr_start + 1, prev_instr_end):
-                    row = <long long>c.indexes[token_idx] * <long long>c.size
-                    our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
+                scale = 1. / 2.
+                sscal(&c.dsize, &scale, c.work, &ONE)
+                
+                # Calculate gradient for prev. instruction using Equ. (8) and update prev. instruction vector
+                row = <long long>c.indexes[prev_instr_start] * <long long>c.size
+                our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
+                if prev_instr_end - prev_instr_start > 1:
+                    scale = 1. / (prev_instr_end - prev_instr_start - 1)
+                    for token_idx in range(prev_instr_start + 1, prev_instr_end):
+                        row = <long long>c.indexes[token_idx] * <long long>c.size
+                        our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
 
-            # Calculate gradient for next instruction using Equ. (8) and update next instruction vector
-            row = <long long>c.indexes[next_instr_start] * <long long>c.size
-            our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
-            if next_instr_end - next_instr_start > 1:
-                scale = 1. / (next_instr_end - next_instr_start - 1)
-                for token_idx in range(next_instr_start + 1, next_instr_end):
-                    row = <long long>c.indexes[token_idx] * <long long>c.size
-                    our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
+                # Calculate gradient for next instruction using Equ. (8) and update next instruction vector
+                row = <long long>c.indexes[next_instr_start] * <long long>c.size
+                our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
+                if next_instr_end - next_instr_start > 1:
+                    scale = 1. / (next_instr_end - next_instr_start - 1)
+                    for token_idx in range(next_instr_start + 1, next_instr_end):
+                        row = <long long>c.indexes[token_idx] * <long long>c.size
+                        our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
 
     model.running_training_loss = c.running_training_loss
     return effective_words

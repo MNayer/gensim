@@ -38,7 +38,8 @@ DEF EXP_TABLE_SIZE = 1000
 DEF MAX_EXP = 6
 cdef REAL_t[EXP_TABLE_SIZE] EXP_TABLE
 
-DEF MAX_SENTENCE_LEN = 10000
+DEF MAX_SENTENCE_LEN = 10000    # Maximum number of sentences 
+DEF MAX_INSTRUCTION_LEN = 10000 # Maximum number of instructions
 
 # function implementations swapped based on BLAS detected in word2vec_inner.pyx init()
 ctypedef REAL_t (*our_dot_ptr) (const int *N, const float *X, const int *incX, const float *Y, const int *incY) nogil
@@ -62,6 +63,7 @@ cdef struct Asm2VecConfig:
     np.uint32_t indexes[MAX_SENTENCE_LEN]
     np.uint32_t reduced_windows[MAX_SENTENCE_LEN]
     int sentence_idx[MAX_SENTENCE_LEN + 1]
+    int instruction_idx[MAX_INSTRUCTION_LEN + 1]
 
     # For hierarchical softmax
     REAL_t *syn1

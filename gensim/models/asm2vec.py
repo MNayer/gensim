@@ -257,7 +257,7 @@ class Asm2Vec(utils.SaveLoad):
 
         Parameters
         ----------
-        sentences : iterable of iterables, optional
+        sentences : iterable of iterables of iterables, optional
             The `sentences` iterable can be simply a list of lists of tokens, but for larger corpora,
             consider an iterable that streams the sentences directly from disk/network.
             See :class:`~gensim.models.word2vec.BrownCorpus`, :class:`~gensim.models.word2vec.Text8Corpus`
@@ -388,6 +388,7 @@ class Asm2Vec(utils.SaveLoad):
         self.min_alpha_yet_reached = float(alpha)
         self.corpus_count = 0
         self.corpus_total_words = 0
+        self.corpus_total_instructions = 0
 
         self.max_final_vocab = max_final_vocab
         self.max_vocab_size = max_vocab_size
@@ -477,9 +478,10 @@ class Asm2Vec(utils.SaveLoad):
 
         """
         self._check_corpus_sanity(corpus_iterable=corpus_iterable, corpus_file=corpus_file, passes=1)
-        total_words, corpus_count = self.scan_vocab(
+        total_words, total_instructions, corpus_count = self.scan_vocab(
             corpus_iterable=corpus_iterable, corpus_file=corpus_file, progress_per=progress_per, trim_rule=trim_rule)
         self.corpus_count = corpus_count
+        self.corpus_total_instructions = total_instructions
         self.corpus_total_words = total_words
         report_values = self.prepare_vocab(update=update, keep_raw_vocab=keep_raw_vocab, trim_rule=trim_rule, **kwargs)
         report_values['memory'] = self.estimate_memory(vocab_size=report_values['num_retained_words'])
@@ -538,6 +540,7 @@ class Asm2Vec(utils.SaveLoad):
     def _scan_vocab(self, sentences, progress_per, trim_rule):
         sentence_no = -1
         total_words = 0
+        total_instructions = 0
         min_reduce = 1
         vocab = defaultdict(int)
         checked_string_types = 0
@@ -555,9 +558,11 @@ class Asm2Vec(utils.SaveLoad):
                     "PROGRESS: at sentence #%i, processed %i words, keeping %i word types",
                     sentence_no, total_words, len(vocab),
                 )
-            for word in sentence:
-                vocab[word] += 1
-            total_words += len(sentence)
+            for instruction in sentence:
+                for word in instruction:
+                    vocab[word] += 1
+                total_words += len(instruction)
+            total_instructions += len(sentence)
 
             if self.max_vocab_size and len(vocab) > self.max_vocab_size:
                 utils.prune_vocab(vocab, min_reduce, trim_rule=trim_rule)
@@ -565,21 +570,21 @@ class Asm2Vec(utils.SaveLoad):
 
         corpus_count = sentence_no + 1
         self.raw_vocab = vocab
-        return total_words, corpus_count
+        return total_words, total_instructions, corpus_count
 
     def scan_vocab(self, corpus_iterable=None, corpus_file=None, progress_per=10000, workers=None, trim_rule=None):
         logger.info("collecting all words and their counts")
         if corpus_file:
             corpus_iterable = LineSentence(corpus_file)
 
-        total_words, corpus_count = self._scan_vocab(corpus_iterable, progress_per, trim_rule)
+        total_words, total_instructions, corpus_count = self._scan_vocab(corpus_iterable, progress_per, trim_rule)
 
         logger.info(
             "collected %i word types from a corpus of %i raw words and %i sentences",
             len(self.raw_vocab), total_words, corpus_count
         )
 
-        return total_words, corpus_count
+        return total_words, total_instructions, corpus_count
 
     def prepare_vocab(
             self, update=False, keep_raw_vocab=False, trim_rule=None,
