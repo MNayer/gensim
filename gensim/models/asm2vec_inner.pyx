@@ -730,7 +730,7 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
 
         #long long a
         long long row
-        REAL_t pre_calc, f_dot, label
+        REAL_t pre_calc, f_dot, label, g, log_e_g
         np.uint32_t target_idx, word_idx
         int d
 
@@ -824,7 +824,8 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
                         # Calculate gradient using adjusted Equ. (7)
                         row = <long long>target_idx * <long long>c.dsize
                         f_dot = our_dot(&c.dsize, delta_vec, &ONE, &c.syn1neg[row], &ONE)
-                        pre_calc = (label - apxsigmoid(f_dot)) * c.alpha
+                        g = apxsigmoid(f_dot)
+                        pre_calc = (label - g) * c.alpha
 
                         # Cummulate gradients for instruction
                         # work += pre_calc * W'[target_idx]
@@ -833,6 +834,13 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
                         # Update token vectors prime
                         # W'[target_idx] += pre_calc * delta_vec
                         our_saxpy(&c.dsize, &pre_calc, delta_vec, &ONE, &c.syn1neg[row], &ONE)
+
+                        if c.compute_loss == 1:
+                            g = (g if d == 0  else -g)
+                            if g <= -MAX_EXP or g >= MAX_EXP:
+                                continue
+                            log_e_g = LOG_TABLE[<int>((g + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]
+                            c.running_training_loss = c.running_training_loss - log_e_g
 
                 scale = 1. / 2.
                 sscal(&c.dsize, &scale, c.work, &ONE)
