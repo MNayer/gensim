@@ -1242,7 +1242,7 @@ class Asm2Vec(utils.SaveLoad):
         job_no = 0
 
         for data_idx, data in enumerate(data_iterator):
-            data_length = self._raw_word_count(data)
+            data_length = self._raw_word_count([data])
 
             # can we fit this sentence into the existing job batch?
             if batch_size + data_length < self.batch_words:
@@ -1531,7 +1531,7 @@ class Asm2Vec(utils.SaveLoad):
             Number of raw words in the corpus chunk.
 
         """
-        return sum(len(sentence) for sentence in job)
+        return sum(len(insn) for sent in job for insn in sent)
 
     def _check_corpus_sanity(self, corpus_iterable=None, corpus_file=None, passes=1):
         """Checks whether the corpus parameters make sense."""

@@ -810,8 +810,6 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
                 
                 for token_idx in range(instr_start, instr_end):
                     # Going through each token (in the instruction).
-                    #printf("sent_idx: %d, sent_start: %d, sent_end: %d, inst_idx: %d, token_idx: %d, prev_instr_start: %d, prev_instr_end: %d, instr_start: %d, instr_end: %d, next_instr_start: %d, next_instr_end: %d\n", sent_idx, sent_start, sent_end, inst_idx, token_idx, prev_instr_start, prev_instr_end, instr_start, instr_end, next_instr_start, next_instr_end)
-                    #c.next_random = a2v_fast_sentence_cbow_neg(c.negative, c.cum_table, c.cum_table_len, c.codelens, prev_instr_vec, next_instr_vec, delta_vec, c.neu1, c.syn0, c.syn1neg, c.size, c.indexes, c.alpha, c.work, token_idx, c.cbow_mean, c.next_random, c.words_lockf, c.words_lockf_len, c.compute_loss, &c.running_training_loss)
                     for d in range(c.negative+1):
                         # For each target (real target + negative samples)
                         if d == 0:
