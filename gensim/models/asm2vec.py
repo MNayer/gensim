@@ -210,6 +210,7 @@ try:
         score_sentence_sg,
         score_sentence_cbow,
         MAX_WORDS_IN_BATCH,
+        MAX_INSTRUCTIONS_IN_BATCH,
         FAST_VERSION,
     )
 except ImportError:
@@ -401,6 +402,10 @@ class Asm2Vec(utils.SaveLoad):
 
         if not hasattr(self, 'wv'):  # set unless subclass already set (eg: FastText)
             self.wv = KeyedVectors(vector_size)
+
+        # Instruction vectors
+        self.iv = KeyedVectors(vector_size * 2)
+
         # EXPERIMENTAL lockf feature; create minimal no-op lockf arrays (1 element of 1.0)
         # advanced users should directly resize/adjust as desired after any vocab growth
         self.wv.vectors_lockf = np.ones(1, dtype=REAL)  # 0.0 values suppress word-backprop-updates; 1.0 allows
@@ -807,6 +812,12 @@ class Asm2Vec(utils.SaveLoad):
         self.wv.key_to_index[word] = len(self.wv)
         self.wv.index_to_key.append(word)
         self.wv.set_vecattr(word, 'count', 1)
+
+    def create_instruction_vectors(self, sentences):
+        for sent in sentences:
+            for insn in sent:
+                # TODO this is inefficient!
+                self.iv.add_vector(" ".join(insn), self.instruction_vector(insn))
 
     def create_binary_tree(self):
         """Create a `binary Huffman tree <https://en.wikipedia.org/wiki/Huffman_coding>`_ using stored vocabulary
@@ -1224,10 +1235,10 @@ class Asm2Vec(utils.SaveLoad):
         job_no = 0
 
         for data_idx, data in enumerate(data_iterator):
-            data_length = self._raw_word_count([data])
+            data_length = self._raw_word_count(data)
 
             # can we fit this sentence into the existing job batch?
-            if batch_size + data_length <= self.batch_words:
+            if batch_size + data_length < self.batch_words:
                 # yes => add it to the current job
                 job_batch.append(data)
                 batch_size += data_length
@@ -2168,7 +2179,8 @@ class PathLineSentences:
             logger.info('reading file %s', file_name)
             with utils.open(file_name, 'rb') as fin:
                 for line in itertools.islice(fin, self.limit):
-                    line = utils.to_unicode(line).split()
+                    #line = utils.to_unicode(line).split("\t")
+                    line = [ins.split(" ") for ins in utils.to_unicode(line[:-1]).split("\t")]
                     i = 0
                     while i < len(line):
                         yield line[i:i + self.max_sentence_length]

@@ -29,9 +29,9 @@ except ImportError:
 
 REAL = np.float32
 
-DEF MAX_SENTENCE_LEN = 10000
-DEF MAX_INSTRUCTION_LEN = 10000
-DEF MAX_EMBEDDING_SIZE = 1000
+DEF MAX_SENTENCE_LEN = 10000    # Max words in batch
+DEF MAX_INSTRUCTION_LEN = 10000 # Max instructions per batch
+DEF MAX_EMBEDDING_SIZE = 1000   # Max embedding size
 
 cdef scopy_ptr scopy=<scopy_ptr>PyCObject_AsVoidPtr(fblas.scopy._cpointer)  # y = x
 cdef saxpy_ptr saxpy=<saxpy_ptr>PyCObject_AsVoidPtr(fblas.saxpy._cpointer)  # y += alpha * x
@@ -730,7 +730,6 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
 
         #long long a
         long long row
-        #REAL_t f, g, count, inv_count = 1.0, label, log_e_f_dot, f_dot
         REAL_t pre_calc, f_dot, label
         np.uint32_t target_idx, word_idx
         int d
@@ -757,21 +756,21 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
                 word_idx = model.wv.key_to_index[token]
                 if c.sample and vocab_sample_ints[word_idx] < random_int32(&c.next_random):
                     continue
-                c.indexes[effective_words] = word_idx
+                c.indexes[effective_words] = word_idx # TODO OVERFLOW
                 if c.hs:
                     c.codelens[effective_words] = <int>len(vocab_codes[word_idx])
                     c.codes[effective_words] = <np.uint8_t *>np.PyArray_DATA(vocab_codes[word_idx])
                     c.points[effective_words] = <np.uint32_t *>np.PyArray_DATA(vocab_points[word_idx])
                 effective_words += 1
                 if effective_words == MAX_SENTENCE_LEN:
-                    break  # TODO: log warning, tally overflow?
+                    raise AssertionError(f"Tally overflow - effective_words ({effective_words}).")
 
             # keep track of which words go into which instruction
             # indices of instruction number X are between <instruction_idx[X], instruction_idx[X])
             effective_instructions += 1
             c.instruction_idx[effective_instructions] = effective_words
             if effective_instructions == MAX_INSTRUCTION_LEN:
-                break  # TODO: log warning, tally overflow?
+                raise AssertionError("Tally overflow - effective_instructions.")
 
         # keep track of which words go into which sentence, so we don't train
         # across sentence boundaries.
@@ -780,8 +779,7 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
         c.sentence_idx[effective_sentences] = effective_instructions
 
         if effective_words == MAX_SENTENCE_LEN:
-            break  # TODO: log warning, tally overflow?
-
+            raise AssertionError(f"Tally overflow - effective_words ({effective_words}).")
 
     # release GIL & train on all sentences
     with nogil:
@@ -809,7 +807,7 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
 
                 # Per thread working memory
                 memset(c.work, 0, c.dsize * cython.sizeof(REAL_t))
-
+                
                 for token_idx in range(instr_start, instr_end):
                     # Going through each token (in the instruction).
                     #printf("sent_idx: %d, sent_start: %d, sent_end: %d, inst_idx: %d, token_idx: %d, prev_instr_start: %d, prev_instr_end: %d, instr_start: %d, instr_end: %d, next_instr_start: %d, next_instr_end: %d\n", sent_idx, sent_start, sent_end, inst_idx, token_idx, prev_instr_start, prev_instr_end, instr_start, instr_end, next_instr_start, next_instr_end)
@@ -1132,3 +1130,4 @@ def init():
 
 FAST_VERSION = init()  # initialize the module
 MAX_WORDS_IN_BATCH = MAX_SENTENCE_LEN
+MAX_INSTRUCTIONS_IN_BATCH = MAX_INSTRUCTION_LEN

@@ -631,7 +631,7 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
     if c.hs:
         vocab_codes = model.wv.expandos['code']
         vocab_points = model.wv.expandos['point']
-
+    
     # prepare C structures so we can go "full C" and release the Python GIL
     c.sentence_idx[0] = 0  # indices of the first sentence always start at 0
     for sent in sentences:
