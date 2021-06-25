@@ -814,10 +814,17 @@ class Asm2Vec(utils.SaveLoad):
         self.wv.set_vecattr(word, 'count', 1)
 
     def create_instruction_vectors(self, sentences):
+        key_to_index = {}
+        keys = []
+        weights = []
         for sent in sentences:
             for insn in sent:
-                # TODO this is inefficient!
-                self.iv.add_vector(" ".join(insn), self.instruction_vector(insn))
+                key = " ".join(insn)
+                if not key in key_to_index:
+                    keys.append(key)
+                    weights.append(self.instruction_vector(insn))
+                    key_to_index[key] = len(keys) - 1
+        self.iv.add_vectors(keys, weights)
 
     def create_binary_tree(self):
         """Create a `binary Huffman tree <https://en.wikipedia.org/wiki/Huffman_coding>`_ using stored vocabulary
