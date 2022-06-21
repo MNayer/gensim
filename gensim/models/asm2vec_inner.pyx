@@ -754,8 +754,8 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, estimate_py, compute
     c.instruction_idx[0] = 0 # indices of the first instruction always start at 0
     for sent, tag in sentences:
         if not sent:
-            raise AssertionError("Training sentences must not be empty.")
-            #continue  # ignore empty sentences; leave effective_sentences unchanged
+            #raise AssertionError("Training sentences must not be empty.")
+            continue  # ignore empty sentences; leave effective_sentences unchanged
         for instruction in sent:
             for token in instruction:
                 if token not in model.wv.key_to_index:
