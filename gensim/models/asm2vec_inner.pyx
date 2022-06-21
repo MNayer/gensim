@@ -32,6 +32,7 @@ REAL = np.float32
 DEF MAX_SENTENCE_LEN = 10000    # Max words in batch
 DEF MAX_INSTRUCTION_LEN = 10000 # Max instructions per batch
 DEF MAX_EMBEDDING_SIZE = 1000   # Max embedding size
+DEF MAX_BATCH_SIZE = 10000      # Max number of sentences in a batch
 
 cdef scopy_ptr scopy=<scopy_ptr>PyCObject_AsVoidPtr(fblas.scopy._cpointer)  # y = x
 cdef saxpy_ptr saxpy=<saxpy_ptr>PyCObject_AsVoidPtr(fblas.saxpy._cpointer)  # y += alpha * x
@@ -576,6 +577,8 @@ cdef init_w2v_config(Asm2VecConfig *c, model, alpha, compute_loss, _work, _neu1=
     c[0].size = model.wv.vector_size
     c[0].dsize = model.wv.vector_size * 2
 
+    c[0].fv = <REAL_t *>(np.PyArray_DATA(model.fv))
+
     if c[0].hs:
         c[0].syn1 = <REAL_t *>(np.PyArray_DATA(model.syn1))
 
@@ -688,7 +691,7 @@ def train_batch_sg(model, sentences, alpha, _work, compute_loss):
     return effective_words
 
 
-def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
+def train_batch_cbow(model, sentences, alpha, _work, _neu1, estimate_py, compute_loss):
     """Update CBOW model by training on a batch of sentences.
 
     Called internally from :meth:`~gensim.models.word2vec.Word2Vec.train`.
@@ -722,11 +725,14 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
         int instr_start, instr_end
         int next_instr_start, next_instr_end
         int token_idx
+        int estimate = estimate_py
         np.uint32_t *vocab_sample_ints
         REAL_t scale
         REAL_t prev_instr_vec[MAX_EMBEDDING_SIZE]
         REAL_t next_instr_vec[MAX_EMBEDDING_SIZE]
+        REAL_t *function_vec
         REAL_t delta_vec[MAX_EMBEDDING_SIZE]
+        int doctags[MAX_BATCH_SIZE]
 
         #long long a
         long long row
@@ -746,9 +752,10 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
     # prepare C structures so we can go "full C" and release the Python GIL
     c.sentence_idx[0] = 0  # indices of the first sentence always start at 0
     c.instruction_idx[0] = 0 # indices of the first instruction always start at 0
-    for sent in sentences:
+    for sent, tag in sentences:
         if not sent:
-            continue  # ignore empty sentences; leave effective_sentences unchanged
+            raise AssertionError("Training sentences must not be empty.")
+            #continue  # ignore empty sentences; leave effective_sentences unchanged
         for instruction in sent:
             for token in instruction:
                 if token not in model.wv.key_to_index:
@@ -772,6 +779,9 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
             if effective_instructions == MAX_INSTRUCTION_LEN:
                 raise AssertionError("Tally overflow - effective_instructions.")
 
+        # Keep track of indexes of the sentences/ functions
+        doctags[effective_sentences] = tag
+
         # keep track of which words go into which sentence, so we don't train
         # across sentence boundaries.
         # indices of sentence number X are between <sentence_idx[X], sentence_idx[X])
@@ -781,9 +791,13 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
         if effective_words == MAX_SENTENCE_LEN:
             raise AssertionError(f"Tally overflow - effective_words ({effective_words}).")
 
+        if effective_sentences >= MAX_BATCH_SIZE:
+            raise AssertionError(f"Tally overflow - effective_sentences ({effective_sentences}).")
+
     # release GIL & train on all sentences
     with nogil:
         for sent_idx in range(0, effective_sentences):
+            function_vec = &c.fv[doctags[sent_idx] * c.dsize] # TODO We cannot use sent_idx here, since effective_sentences is not [0, corpus_size] but rather [0, batch_size]. -> Use KeyedVectors.
             sent_start = c.sentence_idx[sent_idx]
             sent_end = c.sentence_idx[sent_idx + 1]
             for inst_idx in range(sent_start+1, sent_end-1):
@@ -800,10 +814,15 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
                 create_instruction_vector(next_instr_vec, c.syn0, c.size, c.indexes, next_instr_start, next_instr_end)
 
                 # Delta pre calculation
-                scale = 1. / 2.
-                scopy(&c.dsize, prev_instr_vec, &ONE, delta_vec, &ONE)
-                our_saxpy(&c.dsize, &ONEF, next_instr_vec, &ONE, delta_vec, &ONE)
-                sscal(&c.dsize, &scale, delta_vec, &ONE)
+                #scale = 1. / 2.
+                #scopy(&c.dsize, prev_instr_vec, &ONE, delta_vec, &ONE) # delta_vec = prev_instr_vec
+                #our_saxpy(&c.dsize, &ONEF, next_instr_vec, &ONE, delta_vec, &ONE) # delta_vec += next_instr_vec
+                #sscal(&c.dsize, &scale, delta_vec, &ONE) # delta_vec *= 1. / 3.
+                scale = 1. / 3.
+                scopy(&c.dsize, prev_instr_vec, &ONE, delta_vec, &ONE) # delta_vec = prev_instr_vec
+                our_saxpy(&c.dsize, &ONEF, next_instr_vec, &ONE, delta_vec, &ONE) # delta_vec += next_instr_vec
+                our_saxpy(&c.dsize, &ONEF, function_vec, &ONE, delta_vec, &ONE) # delta_vec += function_vec
+                sscal(&c.dsize, &scale, delta_vec, &ONE) # delta_vec *= 1. / 3.
 
                 # Per thread working memory
                 memset(c.work, 0, c.dsize * cython.sizeof(REAL_t))
@@ -823,8 +842,8 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
 
                         # Calculate gradient using adjusted Equ. (7)
                         row = <long long>target_idx * <long long>c.dsize
-                        f_dot = our_dot(&c.dsize, delta_vec, &ONE, &c.syn1neg[row], &ONE)
-                        g = apxsigmoid(f_dot)
+                        f_dot = our_dot(&c.dsize, delta_vec, &ONE, &c.syn1neg[row], &ONE) # f_dot = dot(delta_vec, W'[target_idx])
+                        g = apxsigmoid(f_dot) # g = sigmoid(f_dot)
                         pre_calc = (label - g) * c.alpha
 
                         # Cummulate gradients for instruction
@@ -833,7 +852,8 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
 
                         # Update token vectors prime
                         # W'[target_idx] += pre_calc * delta_vec
-                        our_saxpy(&c.dsize, &pre_calc, delta_vec, &ONE, &c.syn1neg[row], &ONE)
+                        if estimate == 0:
+                            our_saxpy(&c.dsize, &pre_calc, delta_vec, &ONE, &c.syn1neg[row], &ONE)
 
                         if c.compute_loss == 1:
                             g = (g if d == 0  else -g)
@@ -842,26 +862,30 @@ def train_batch_cbow(model, sentences, alpha, _work, _neu1, compute_loss):
                             log_e_g = LOG_TABLE[<int>((g + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]
                             c.running_training_loss = c.running_training_loss - log_e_g
 
-                scale = 1. / 2.
+                scale = 1. / 3.
                 sscal(&c.dsize, &scale, c.work, &ONE)
                 
-                # Calculate gradient for prev. instruction using Equ. (8) and update prev. instruction vector
-                row = <long long>c.indexes[prev_instr_start] * <long long>c.size
-                our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
-                if prev_instr_end - prev_instr_start > 1:
-                    scale = 1. / (prev_instr_end - prev_instr_start - 1)
-                    for token_idx in range(prev_instr_start + 1, prev_instr_end):
-                        row = <long long>c.indexes[token_idx] * <long long>c.size
-                        our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
+                if estimate == 0:
+                    # Calculate gradient for prev. instruction using Equ. (8) and update prev. instruction vector
+                    row = <long long>c.indexes[prev_instr_start] * <long long>c.size
+                    our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
+                    if prev_instr_end - prev_instr_start > 1:
+                        scale = 1. / (prev_instr_end - prev_instr_start - 1)
+                        for token_idx in range(prev_instr_start + 1, prev_instr_end):
+                            row = <long long>c.indexes[token_idx] * <long long>c.size
+                            our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
 
-                # Calculate gradient for next instruction using Equ. (8) and update next instruction vector
-                row = <long long>c.indexes[next_instr_start] * <long long>c.size
-                our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
-                if next_instr_end - next_instr_start > 1:
-                    scale = 1. / (next_instr_end - next_instr_start - 1)
-                    for token_idx in range(next_instr_start + 1, next_instr_end):
-                        row = <long long>c.indexes[token_idx] * <long long>c.size
-                        our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
+                    # Calculate gradient for next instruction using Equ. (8) and update next instruction vector
+                    row = <long long>c.indexes[next_instr_start] * <long long>c.size
+                    our_saxpy(&c.size, &ONEF, c.work, &ONE, &c.syn0[row], &ONE)
+                    if next_instr_end - next_instr_start > 1:
+                        scale = 1. / (next_instr_end - next_instr_start - 1)
+                        for token_idx in range(next_instr_start + 1, next_instr_end):
+                            row = <long long>c.indexes[token_idx] * <long long>c.size
+                            our_saxpy(&c.size, &scale, &c.work[c.size], &ONE, &c.syn0[row], &ONE)
+
+                # Update function vector
+                our_saxpy(&c.dsize, &ONEF, c.work, &ONE, function_vec, &ONE)
 
     model.running_training_loss = c.running_training_loss
     return effective_words

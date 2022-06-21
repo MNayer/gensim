@@ -406,6 +406,10 @@ class Asm2Vec(utils.SaveLoad):
         # Instruction vectors
         self.iv = KeyedVectors(vector_size * 2)
 
+        # Function (~document) vectors
+        # Set in init_weights method
+        self.fv = None
+
         # EXPERIMENTAL lockf feature; create minimal no-op lockf arrays (1 element of 1.0)
         # advanced users should directly resize/adjust as desired after any vocab growth
         self.wv.vectors_lockf = np.ones(1, dtype=REAL)  # 0.0 values suppress word-backprop-updates; 1.0 allows
@@ -549,7 +553,8 @@ class Asm2Vec(utils.SaveLoad):
         min_reduce = 1
         vocab = defaultdict(int)
         checked_string_types = 0
-        for sentence_no, sentence in enumerate(sentences):
+        for sentence_no, sentence_tagged_doc in enumerate(sentences):
+            sentence = sentence_tagged_doc.words
             if not checked_string_types:
                 if isinstance(sentence, str):
                     logger.warning(
@@ -879,6 +884,7 @@ class Asm2Vec(utils.SaveLoad):
             self.syn1 = np.zeros((len(self.wv), self.layer1_size), dtype=REAL)
         if self.negative:
             self.syn1neg = np.zeros((len(self.wv), self.layer1_size), dtype=REAL)
+        self.fv = np.random.rand(self.corpus_count, self.layer1_size).astype(REAL) - 0.5
 
     def update_weights(self):
         """Copy all the existing weights, and reset the weights for the newly added vocabulary."""
@@ -962,11 +968,12 @@ class Asm2Vec(utils.SaveLoad):
 
         """
         work, neu1 = inits
+        estimate = 0
         tally = 0
         if self.sg:
             tally += train_batch_sg(self, sentences, alpha, work, self.compute_loss)
         else:
-            tally += train_batch_cbow(self, sentences, alpha, work, neu1, self.compute_loss)
+            tally += train_batch_cbow(self, sentences, alpha, work, neu1, estimate, self.compute_loss)
         return tally, self._raw_word_count(sentences)
 
     def _clear_post_train(self):
@@ -1241,13 +1248,15 @@ class Asm2Vec(utils.SaveLoad):
         next_alpha = self._get_next_alpha(0.0, cur_epoch)
         job_no = 0
 
-        for data_idx, data in enumerate(data_iterator):
-            data_length = self._raw_word_count([data])
+        for data_idx, tagged_doc in enumerate(data_iterator):
+            data = tagged_doc.words
+            tag = tagged_doc.tags[0]
+            data_length = self._raw_word_count([(data, tag)])
 
             # can we fit this sentence into the existing job batch?
             if batch_size + data_length < self.batch_words:
                 # yes => add it to the current job
-                job_batch.append(data)
+                job_batch.append((data, tag))
                 batch_size += data_length
             else:
                 job_no += 1
@@ -1265,7 +1274,7 @@ class Asm2Vec(utils.SaveLoad):
                 next_alpha = self._get_next_alpha(epoch_progress, cur_epoch)
 
                 # add the sentence that didn't fit as the first item of a new job
-                job_batch, batch_size = [data], data_length
+                job_batch, batch_size = [(data, tag)], data_length
         # add the last job too (may be significantly smaller than batch_words)
         if job_batch:
             job_no += 1
@@ -1531,7 +1540,64 @@ class Asm2Vec(utils.SaveLoad):
             Number of raw words in the corpus chunk.
 
         """
-        return sum(len(insn) for sent in job for insn in sent)
+        return sum(len(insn) for doc, tag in job for insn in doc)
+
+    def infer_vector(self, doc_words, alpha=None, min_alpha=None, epochs=None):
+        """Infer a vector for given post-bulk training document.
+
+        Notes
+        -----
+        Subsequent calls to this function may infer different representations for the same document.
+        For a more stable representation, increase the number of epochs to assert a stricter convergence.
+
+        Parameters
+        ----------
+        doc_words : list of list of str
+            A document for which the vector representation will be inferred.
+        alpha : float, optional
+            The initial learning rate. If unspecified, value from model initialization will be reused.
+        min_alpha : float, optional
+            Learning rate will linearly drop to `min_alpha` over all inference epochs. If unspecified,
+            value from model initialization will be reused.  
+        epochs : int, optional
+            Number of times to train the new document. Larger values take more time, but may improve
+            quality and run-to-run stability of inferred vectors. If unspecified, the `epochs` value
+            from model initialization will be reused.
+        
+        Returns
+        -------
+        np.ndarray
+            The inferred paragraph vector for the new document.
+        
+        """
+        if isinstance(doc_words, str):  # a common mistake; fail with a nicer error
+            raise TypeError("Parameter doc_words of infer_vector() must be a list of strings (not a single string).")
+                           
+        alpha = alpha or self.alpha
+        min_alpha = min_alpha or self.min_alpha
+        epochs = epochs or self.epochs
+
+        doctag_vectors = pseudorandom_weak_vector(self.vector_size*2, seed_string=' '.join(' '.join(insn) for insn in doc_words))
+        doctag_vectors = doctag_vectors.reshape(1, self.vector_size*2)
+
+        doctags_lockf = np.ones(1, dtype=REAL)
+        doctag_indexes = [0]
+        work = np.zeros(self.layer1_size, dtype=REAL)
+        neu1 = matutils.zeros_aligned(self.layer1_size, dtype=REAL)
+
+        alpha_delta = (alpha - min_alpha) / max(epochs - 1, 1)
+
+        fv = self.fv
+        self.fv = doctag_vectors
+        estimate = 1
+
+        for i in range(epochs):
+            train_batch_cbow(self, [(doc_words, 0)], alpha, work, neu1, estimate, self.compute_loss)
+            alpha -= alpha_delta
+
+        self.fv = fv
+
+        return doctag_vectors[0]
 
     def _check_corpus_sanity(self, corpus_iterable=None, corpus_file=None, passes=1):
         """Checks whether the corpus parameters make sense."""

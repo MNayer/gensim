@@ -58,6 +58,7 @@ cdef struct Asm2VecConfig:
     np.uint32_t words_lockf_len
     REAL_t *work
     REAL_t *neu1
+    REAL_t *fv
 
     int codelens[MAX_SENTENCE_LEN]
     np.uint32_t indexes[MAX_SENTENCE_LEN]
