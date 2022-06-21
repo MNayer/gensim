@@ -553,8 +553,7 @@ class Asm2Vec(utils.SaveLoad):
         min_reduce = 1
         vocab = defaultdict(int)
         checked_string_types = 0
-        for sentence_no, sentence_tagged_doc in enumerate(sentences):
-            sentence = sentence_tagged_doc.words
+        for sentence_no, sentence in enumerate(sentences):
             if not checked_string_types:
                 if isinstance(sentence, str):
                     logger.warning(
@@ -1248,9 +1247,8 @@ class Asm2Vec(utils.SaveLoad):
         next_alpha = self._get_next_alpha(0.0, cur_epoch)
         job_no = 0
 
-        for data_idx, tagged_doc in enumerate(data_iterator):
-            data = tagged_doc.words
-            tag = tagged_doc.tags[0]
+        for data_idx, data in enumerate(data_iterator):
+            tag = data_idx
             data_length = self._raw_word_count([(data, tag)])
 
             # can we fit this sentence into the existing job batch?
